@@ -9,6 +9,7 @@ import time
 import json
 import os
 import shutil
+import select
 import sys
 from colorama import Fore, Style, init
 
@@ -25,6 +26,10 @@ tracker_port = 10000
 # Time interval to fetch peer/seed updates from tracker
 
 UPDATE_TIME = 5
+
+# Timeout for recv requests (in seconds)
+
+RECV_TIMEOUT = 2  
 
 # File transfer chunk size (256 KB)
 
@@ -114,9 +119,13 @@ class me:
         self.on = True
         self.files = {}             # seed -> File object
         self.lock = threading.Lock()
-        self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.s.bind(("", 0))
-        self.s.listen(20)
+        try:
+            self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.s.bind(("", 0))
+            self.s.listen(20)
+        except socket.error as e:
+            print(f"{ERROR}Error creating peer socket: {e}{RESET}")
+            exit(1)
 
         # Load seeds from local seeds.txt
         if not os.path.exists(os.path.join(dir_name, "seeds.txt")):
@@ -130,6 +139,14 @@ class me:
                 if seed_info:
                     seed_info = seed_info.strip().split(",")
                     self.seeds[seed_info[0]] = []
+                    
+                    if not os.path.exists(os.path.join(dir_name, seed_info[0])):
+                        print(f"{ERROR}Seed directory not found for {seed_info[0]}{RESET}")
+                        continue
+                    if not os.path.exists(os.path.join(dir_name, seed_info[0], "status.txt")):
+                        print(f"{ERROR}Status file not found for {seed_info[0]}{RESET}")
+                        continue
+                    
                     self.files[seed_info[0]] = File(seed_info[0])
 
     # Periodically fetch peer list updates from the tracker
@@ -141,8 +158,23 @@ class me:
             self.tracker_sock.setblocking(True)
             
             # Send a request to the tracker for the current peer list
-            self.tracker_sock.sendall("Send Update".encode())
-            msg = self.tracker_sock.recv(100000000).decode()
+            
+            try:
+                self.tracker_sock.sendall("Send Update".encode())
+                 # Wait for response with timeout
+                ready, _, _ = select.select([self.tracker_sock], [], [], RECV_TIMEOUT)  
+                if not ready:                                                                 
+                    print(f"{WARNING}Tracker update timed out{RESET}")                     
+                    continue                                                                   
+
+                msg = self.tracker_sock.recv(100000000).decode()              
+            except socket.error as e:
+                print(f"{ERROR}Error receiving update from tracker: {e}{RESET}")
+                continue
+            except Exception as e:
+                print(f"{ERROR}Error: {e}{RESET}")
+                continue
+                           
             all_seeds = json.loads(msg)
             temp_seeds = {}
             
@@ -156,21 +188,43 @@ class me:
                 print(f"{HIGHLIGHT}New seeds available{RESET}")
                 
                 self.seeds = temp_seeds
+        self.tracker_sock.close()
+        print(f"{SUCCESS}Tracker connection closed{RESET}")
                 
     # Connect to the tracker and register this peer
     def tracker_connection(self, tracker_ip, tracker_port):
-        self.tracker_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.tracker_sock.connect((tracker_ip, tracker_port))
-        data = self.tracker_sock.recv(1024).decode()
-        
-        # Send the port number and list of seeds to the tracker
-        if(data == "Send Port"):
-            message = str(self.s.getsockname()[1]) + "&" + json.dumps(list(self.seeds.keys()))
-            self.tracker_sock.sendall(message.encode())
-        else:
-            print(f"{ERROR}Error in connection{RESET}")
-        data = self.tracker_sock.recv(1024).decode()
-        
+        try:
+            self.tracker_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.tracker_sock.connect((tracker_ip, tracker_port))
+
+            # Wait for initial prompt
+            ready, _, _ = select.select([self.tracker_sock], [], [], RECV_TIMEOUT)  
+            if not ready:                                                              
+                print(f"{ERROR}Tracker connection prompt timed out{RESET}")          
+                return                                                                 
+            data = self.tracker_sock.recv(1024).decode()                              
+
+            # Send the port number and list of seeds to the tracker
+            if(data == "Send Port"):
+                message = str(self.s.getsockname()[1]) + "&" + json.dumps(list(self.seeds.keys()))
+                self.tracker_sock.sendall(message.encode())
+            else:
+                print(f"{ERROR}Error in connection{RESET}")
+                return
+
+            # Wait for confirmation
+            ready, _, _ = select.select([self.tracker_sock], [], [], RECV_TIMEOUT)  
+            if not ready:                                                              
+                print(f"{ERROR}Tracker confirmation timed out{RESET}")                
+                return                                                                 
+            data = self.tracker_sock.recv(1024).decode()     
+        except socket.error as e:
+            print(f"{ERROR}Error connecting to tracker: {e}{RESET}")
+            return
+        except Exception as e:
+            print(f"{ERROR}Error: {e}{RESET}")
+            return                         
+
         # Check if the tracker is connected
         if(data == "Connected"):
             print(f"{SUCCESS}Connected to tracker{RESET}")
@@ -189,7 +243,15 @@ class me:
         sock_peer.setblocking(True)
 
         # Receive initial request
-        req = sock_peer.recv(10000000)
+        ready, _, _ = select.select([sock_peer], [], [], RECV_TIMEOUT)  
+        if not ready:                                                     
+            print(f"{ERROR}Peer {HIGHLIGHT}{peer_addr}{ERROR} request timed out{RESET}")  
+            sock_peer.close()                                             
+            with self.lock:
+                del self.connections[peer_addr]
+            return                                                         
+        req = sock_peer.recv(10000000)  
+        
         print(f"{INFO}Received request from {HIGHLIGHT}{peer_addr}{INFO}: {req.decode()}{RESET}")
         
         # Check if the request is for a chunk list
@@ -200,14 +262,30 @@ class me:
             if seed not in self.files.keys():
                 sock_peer.sendall("Seed not available".encode())
                 sock_peer.close()
-                del self.connections[peer_addr]
+                with self.lock:
+                    del self.connections[peer_addr]
                 return
             
-            sock_peer.sendall(json.dumps(list(self.files[seed].completed_chunks)).encode())
+            try:
+                sock_peer.sendall(json.dumps(list(self.files[seed].completed_chunks)).encode())
+            except socket.error as e:
+                print(f"{ERROR}Error sending chunk list to {HIGHLIGHT}{peer_addr}{ERROR}: {e}")
+                sock_peer.close()
+                with self.lock:
+                    del self.connections[peer_addr]
+                return
+            
             print(f"{SUCCESS}Sent chunk list for {HIGHLIGHT}{seed}{SUCCESS} to {HIGHLIGHT}{peer_addr}{RESET}")
         
         # Serve requested chunks
-        req = sock_peer.recv(10000000)
+        ready, _, _ = select.select([sock_peer], [], [], RECV_TIMEOUT)  
+        if not ready:                                                     
+            print(f"{ERROR}Peer {HIGHLIGHT}{peer_addr}{ERROR} serve timed out{RESET}")  
+            sock_peer.close()                                             
+            return                                                         
+        req = sock_peer.recv(10000000)  
+        
+        print(f"{INFO}Received request from {HIGHLIGHT}{peer_addr}{INFO}: {req.decode()}{RESET}")
         
         # Loop until the peer disconnects or sends "exit"
         while req.decode() != "exit":
@@ -219,10 +297,21 @@ class me:
                 
                 with open(os.path.join(self.files[seed].path,"chunks", str(chunk)), "rb") as f:
                     data = f.read()
-                    sock_peer.sendall(data)
+                    
+                    try:
+                        sock_peer.sendall(data)
+                    except socket.error as e:
+                        print(f"{ERROR}Error sending chunk {HIGHLIGHT}{chunk}{ERROR} to {HIGHLIGHT}{peer_addr}{RESET}: {e}")
+                        break
+                    
                     print(f"{SUCCESS}Sent chunk {HIGHLIGHT}{chunk}{SUCCESS} to {HIGHLIGHT}{peer_addr}{RESET}")
                     
-            req = sock_peer.recv(10000000)
+            ready, _, _ = select.select([sock_peer], [], [], RECV_TIMEOUT)  
+            if not ready:                                                     
+                print(f"{ERROR}Peer {HIGHLIGHT}{peer_addr}{ERROR} chunk transfer timed out{RESET}")  
+                break                                                         
+            req = sock_peer.recv(10000000)  
+
         
         print(f"{INFO}Peer {HIGHLIGHT}{peer_addr}{INFO} disconnected{RESET}")
         with self.lock:
@@ -233,10 +322,20 @@ class me:
     # Accept incoming connections from peers (threaded)
     def handle_peer_requests(self):
         while self.on:
+            
+            readable, _, exceptional = select.select([self.s], [], [self.s], 5.0)
+            if exceptional:
+                print(f"{ERROR}Tracker socket error{RESET}")
+                break
+            if not readable:
+                continue
+            
             sock_peer, peer_addr = self.s.accept()
             print(f"{INFO}New connection from {HIGHLIGHT}{peer_addr}{RESET}")
             self.recv_msg_thread = threading.Thread(target=self.recv_msg_peer, args=(sock_peer, peer_addr))
             self.recv_msg_thread.start()
+        self.s.close()
+        print(f"{SUCCESS}Peer socket closed{RESET}")
 
     # Manage downloading chunks from a single peer
     def manage_peer(self, peer, seed):
@@ -250,13 +349,26 @@ class me:
         peer = Peer(peer, None)
         peer.ip ,peer.port = peer.id.split(":")
         peer.port = int(peer.port)
-        peer.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        peer.sock.connect((peer.ip, peer.port))
-        self.connections[peer.id] = peer.sock
+        try:
+            peer.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            peer.sock.connect((peer.ip, peer.port))
+        except socket.error as e:
+            print(f"{ERROR}Error connecting to peer {HIGHLIGHT}{peer.id}{ERROR}: {e}{RESET}")
+            return
+        with self.lock:
+            self.connections[peer.id] = peer.sock
         
         peer.sock.setblocking(True)
         peer.sock.sendall(("Send chunk list for "+seed).encode())
-        data = peer.sock.recv(1000000)
+        
+        # Wait for the peer to respond with the chunk list
+        ready, _, _ = select.select([peer.sock], [], [], RECV_TIMEOUT)  
+        if not ready:                                                     
+            print(f"{WARNING}Timeout requesting chunk list from {HIGHLIGHT}{peer.id}{WARNING}{RESET}")  
+            peer.sock.close()                                             
+            return                                                         
+        data = peer.sock.recv(1000000)  
+
         
         # Check if the seed is available with the peer
         if(data.decode() == "Seed not available"):
@@ -289,8 +401,20 @@ class me:
         # Check if there are any chunks to download
         for chunk in chunks:
             print(f"{INFO}Requesting chunk {HIGHLIGHT}{chunk}{INFO} from peer {HIGHLIGHT}{peer.id}{RESET}")
-            peer.sock.sendall(("Requesting chunk "+ str(chunk) + " for "+seed).encode())
-            data = peer.sock.recv(1000000)     
+            try:
+                peer.sock.sendall(("Requesting chunk "+ str(chunk) + " for "+seed).encode())
+            except socket.error as e:
+                print(f"{ERROR}Error requesting chunk {HIGHLIGHT}{chunk}{ERROR} from peer {HIGHLIGHT}{peer.id}{RESET}: {e}")
+                with self.lock:
+                    self.files[seed].completed_chunks.remove(chunk)
+                continue
+            
+            ready, _, _ = select.select([peer.sock], [], [], RECV_TIMEOUT)  
+            if not ready:                                                     
+                print(f"{ERROR}Chunk {HIGHLIGHT}{chunk}{ERROR} recv timed out from {HIGHLIGHT}{peer.id}{RESET}")  
+                break
+            data = peer.sock.recv(1000000)       
+            
             with open(os.path.join(self.files[seed].path,"chunks", str(chunk)), "wb") as f:
                 f.write(data)
                 print(f"{SUCCESS}Received chunk {HIGHLIGHT}{chunk}{SUCCESS} from peer {HIGHLIGHT}{peer.id}{RESET}")
@@ -461,7 +585,21 @@ def main():
     peer_requests = threading.Thread(target=main_peer.handle_peer_requests, name="peer_requests", daemon=True)
     peer_requests.start()
 
-    tracker_thread.join()
+    try:
+        while True:
+            time.sleep(1) # Keep the main thread alive
+    except KeyboardInterrupt:
+        # Gracefully handle keyboard interrupt
+        print(f"{ERROR}Peer interrupted by user{RESET}")
+        main_peer.on = False
+    except Exception as e: #Print any other exceptions
+        print(f"{ERROR}Error starting Peer: {e}{RESET}")
+        main_peer.on = False
 
+    tracker_thread.join()
+    peer_thread.join()
+    peer_requests.join()
+
+    print(f"{SUCCESS}Peer services stopped{RESET}")
 if __name__ == "__main__":
     main()
