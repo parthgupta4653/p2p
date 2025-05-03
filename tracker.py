@@ -1,239 +1,159 @@
+# Tracker-side implementation for a simle P2P file sharing system
+# This code handles peer connections, seed management, and communication between peers.
+
 import socket
 import threading
 import time
 import json
 import select
+from colorama import Fore, Style, init
 
-# TIme (in seconds) to wait for a peer before timing out
+# Initialize colorama
+init(autoreset=True)
+
+# Color formats for different message types
+INFO = Fore.CYAN
+SUCCESS = Fore.GREEN
+WARNING = Fore.YELLOW
+ERROR = Fore.RED
+HIGHLIGHT = Fore.MAGENTA
+STATUS = Fore.BLUE
+RESET = Style.RESET_ALL
+
+# Maximum wait time for peer activity before timeout (in seconds)
 CHECK_PEER_TIMEOUT = 300
+
+# Limit on simultaneous peer connections
 MAX_PEER_CONNECTIONS = 20
 
-# Class For Peer
+# Represents a peer connected to the tracker
 class Peer: 
-    def __init__(self, id, seeds,sock):
-        
-        # unique id for each peer: (ip_address:port)
-        self.id = f"{id}"
-        
-        # list of the files seeds this peer has
-        self.seeds = seeds
-        
-        # this peer's socket object
-        self.sock = sock
+    def __init__(self, id, seeds, sock):
+        self.id = f"{id}"          # Peer identifier: "IP:Port"
+        self.seeds = seeds         # List of file seed hashes
+        self.sock = sock           # Peer socket connection
 
-# Class For Tracker
+# The tracker coordinates peers and seed availability
 class Tracker:
     def __init__(self):
-        
-        # binds tracker to given host, currently empty signify binds to all available network interfaces
-        self.host = ""
-        
-        # tracker port 
-        self.port = 10000
-        
-        # Seeds Dictionary: Mapping seed hash -> list of Peer that have this seed hash
-        # It store the data of seeds and their respective Peers
-        self.seeds = {}
-        
-        # Peer Dictionary: Mapping peer id -> Peer Instance
-        # It store the details of current connected Peers
-        self.connections = {}
-        
-        # Create Tracker Socket
+        self.host = ""             # Bind to all available interfaces
+        self.port = 10000          # Tracker's port
+        self.seeds = {}            # Map: seed hash -> list of peers
+        self.connections = {}      # Map: peer ID -> Peer object
+
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.s.bind((self.host, self.port))
-        
-        # Start Listening for incoming connections
-        # The maximum number of queued connections is set to MAX_PEER_CONNECTIONS
         self.s.listen(MAX_PEER_CONNECTIONS)
-        
-        print(f"Tracker started on {self.host}:{self.port}")
-        print(f"Listening for incoming connections...")
-        print(f"Max Peer Connections: {MAX_PEER_CONNECTIONS}")
-        print(f"\n")
 
-    # function to disconnect and remove a peer from all tracker records
+        print(f"{SUCCESS}Tracker started on {HIGHLIGHT}{self.host}:{self.port}{RESET}")
+        print(f"{INFO}Listening for incoming connections...{RESET}")
+        print(f"{INFO}Max Peer Connections: {HIGHLIGHT}{MAX_PEER_CONNECTIONS}{RESET}\n")
+
+    # Remove a peer from tracker records and clean up its entries
     def kick_peer(self, peer):
-        
-        print(f"[Tracker] Disconnecting and removing peer {peer.id}")
-        
-        # close the peer's socket
+        print(f"{STATUS}[Tracker] {WARNING}Disconnecting and removing peer {HIGHLIGHT}{peer.id}{RESET}")
         peer.sock.close()
-        
-        # remove from active connections
         del self.connections[peer.id]
-        
-        # for each seed in the peer's seeds list, remove the peer from the seeds dictionary
-        for seed in peer.seeds:
-            # Remove the peer from the list of peers for that seed
-            self.seeds[seed].remove(peer)
-            
-            # If no peers are left for that seed, remove the seed from the seeds dictionary
-            if not self.seeds[seed]:
-                del self.seeds[seed]
-                
-        print(f"Peer {peer.id} removed from tracker records")
 
-    # function to clean up all sockets when tracker is destroyed
+        for seed in peer.seeds:
+            self.seeds[seed].remove(peer)
+            if not self.seeds[seed]:  # Remove seed if no peers left
+                del self.seeds[seed]
+
+        print(f"{SUCCESS}Peer {HIGHLIGHT}{peer.id}{SUCCESS} removed from tracker records{RESET}")
+
+    # Clean up all peer sockets and shut down tracker socket
     def __del__(self):
-        
-        print("Cleaning up all sockets...")
-        
-        # close the socket of each peer in the connections dictionary
+        print(f"{STATUS}Cleaning up all sockets...{RESET}")
         for peer in self.connections.values():
             peer.sock.close()
-            
-        # close the Tracker socket    
         self.s.close()
-        
-        print("All sockets closed")
-        print("Tracker Destroyed")
+        print(f"{SUCCESS}All sockets closed{RESET}")
+        print(f"{SUCCESS}Tracker Destroyed{RESET}")
     
-    # function to send the current peer list for each seed to the requesting peer
+    # Send current peer list for each seed to the requesting peer
     def send_update(self, peer):
-        
-        print(f"[Tracker] Preparing update for peer {peer.id}")
-        
-        # Sock object of the peer to send the update
+        print(f"{STATUS}[Tracker] {INFO}Preparing update for peer {HIGHLIGHT}{peer.id}{RESET}")
         sock_peer = peer.sock
-        
-        # Set the socket to blocking mode
-        # This means that the socket will block the program until it can send data
         sock_peer.setblocking(True)
-        
-        # Build payload: seed -> list of peer IDs
-        # This creates a dictionary where the keys are the seeds and the values are lists of peer IDs
-        payload = { seed: [p.id for p in peers] 
+
+        # Build dictionary: seed -> list of peer IDs (excluding self)
+        payload = { seed: [p.id for p in peers if p.id != peer.id]
                     for seed, peers in self.seeds.items() }
-        
-        # Remove your own peer ID from the payload
-        for item in payload.values():
-            if(peer.id in item):
-                item.remove(peer.id)
-        
-        # Convert the payload to JSON format
+
         message = json.dumps(payload).encode('utf8')
-        
-        # Send the payload to the peer
         sock_peer.sendall(message)
-        
-        print(f"[Tracker] Update sent to peer {peer.id}")
-        
-        # Wait for the peer to acknowledge the update
-        time.sleep(1)                 
-                    
-    # function to receive messages from the peer
-    # This function is called when a new peer connects to the tracker
-    def recv_msg(self, sock_peer, peer_addr):   
-        
-        # Set the socket to non-blocking mode
-        # This means that the socket will not block the program if it cannot send or receive data immediately
+        print(f"{STATUS}[Tracker] {SUCCESS}Update sent to peer {HIGHLIGHT}{peer.id}{RESET}")
+        time.sleep(1)
+
+    # Handle interaction with a connected peer
+    def recv_msg(self, sock_peer, peer_addr):
         sock_peer.setblocking(True)
-        
-        # Send a message to the peer to request the port number and seeds
         sock_peer.sendall("Send Port".encode())
-        
-        # Wait for the peer to respond with its port number and seeds
         sock_peer.settimeout(2.0)
-        
-        # Receive the peer's response
-        peer_port,seeds = sock_peer.recv(1024).decode().split("&")
+
+        # Expecting peer response: "<port>&<seed_list_json>"
+        peer_port, seeds = sock_peer.recv(1024).decode().split("&")
         peer_port = int(peer_port)
-        
-        # JSON decode the seeds string to a list of seeds
         seeds = json.loads(seeds)
         peer_ip = peer_addr[0]
-        
-        # Check if the peer is already connected
-        if f"{peer_ip}:{peer_port}" in self.connections.keys():
-            print(f"Peer {peer_ip}:{peer_port} already connected")
+        peer_id = f"{peer_ip}:{peer_port}"
+
+        if peer_id in self.connections:
+            print(f"{WARNING}Peer {HIGHLIGHT}{peer_id}{WARNING} already connected{RESET}")
             return
-        
-        # Create a new Peer instance
-        peer = Peer(f"{peer_ip}:{peer_port}",seeds,sock_peer)
-        
-        # Add the peer to the connections dictionary
+
+        peer = Peer(peer_id, seeds, sock_peer)
         self.connections[peer.id] = peer
-        
-        # For each seed in the peer's seeds list, add the peer to the seeds dictionary
+
         for seed in seeds:
-            
-            # If the seed is not already in the seeds dictionary, create a new list for it
             if seed not in self.seeds:
                 self.seeds[seed] = []
-                
-            # Add the peer to the list of peers for that seed
             self.seeds[seed].append(peer)
-        print(f"Peer {peer.id} connected with seeds: {seeds}")
-        
-        # Send a message to the peer to confirm the connection
+
+        print(f"{SUCCESS}Peer {HIGHLIGHT}{peer.id}{SUCCESS} connected with seeds: {HIGHLIGHT}{seeds}{RESET}")
         sock_peer.sendall("Connected".encode())
-        
-        # Wait for the peer to send a message
+
         while True:
-            
-            # Block for up to CHECK_PEER_TIMEOUT seconds waiting for sock_peer to have data ready to read
+            # Wait for data or timeout
             flag, _, _ = select.select([sock_peer], [], [], CHECK_PEER_TIMEOUT)
-            
-            # If the peer times out, break the loop and remove the peer from the tracker
-            if(not flag):
-                print(f"Peer {peer.id} timed out")
+            if not flag:
+                print(f"{WARNING}Peer {HIGHLIGHT}{peer.id}{WARNING} timed out{RESET}")
                 break
-            
-            # If the peer sends a message, receive it and print it
+
             msg = sock_peer.recv(1024).decode()
-            
-            print(f"Received message from peer {peer.id}: {msg}")
-            
-            # If the message is "exit", break the loop and remove the peer from the tracker
+            print(f"{INFO}Received message from peer {HIGHLIGHT}{peer.id}{INFO}: {msg}{RESET}")
+
             if msg == "exit":
                 break
-            
-            # If the message is "Send Update", send the update to the peer
             elif msg == "Send Update":
                 self.send_update(peer)
-                
-        # Disconnect the peer and remove it from the tracker
+
         self.kick_peer(peer)
         
-    # function to accept incoming connections from peers
+    # Accept new incoming peer connections in a loop
     def accept_connections(self):
-        
-        # This function runs in a separate thread to accept incoming connections from peers
         while True:
-            
-            # Accept a new connection from a peer
             sock_peer, peer_addr = self.s.accept()
+            print(f"{INFO}New connection from {HIGHLIGHT}{peer_addr}{RESET}")
             
-            # Threading to handle the peer connection
-            # This creates a new thread for each peer that connects to the tracker
-            print(f"New connection from {peer_addr}")
+            # A new thread for each peer connection
             self.recv_msg_thread = threading.Thread(target=self.recv_msg, args=(sock_peer, peer_addr))
-            
-            # Start the thread to handle the peer connection
             self.recv_msg_thread.start()
     
-    # function to run the tracker
+    # Launch the tracker service
     def run(self):
         
-        # Start the accept_connections function in a separate thread
+        # Start the accept connections thread
         self.accept_thread = threading.Thread(target=self.accept_connections)
-        
-        # Start the thread to accept incoming connections
         self.accept_thread.start()
-        
-        # Wait for the accept thread to finish
         self.accept_thread.join()
         
 
-# Create a Tracker instance and start it
+# Create and start the tracker
 tracker = Tracker()
+print(f"{HIGHLIGHT}Tracker Instance has been created{RESET}")
+print(f"{INFO}Starting Tracker...{RESET}")
+print(f"{SUCCESS}Tracker is running...{RESET}\n")
 
-print("Tracker Instance has been created")
-print("Starting Tracker...")
-print("\n")
-print("Tracker is running...")
-print("\n")
-
-# Run the tracker
 tracker.run()
