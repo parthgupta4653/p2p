@@ -7,6 +7,10 @@ import time
 import json
 import select
 from colorama import Fore, Style, init
+from cryptography.fernet import Fernet
+
+MASTER_KEY = b"hLNpt1Oc7DpFtmwJgeAq_wK7zR77JZyGyVcjRJGrYU0="  
+master_cipher = Fernet(MASTER_KEY)
 
 # Initialize colorama
 init(autoreset=True)
@@ -35,6 +39,7 @@ class Peer:
         self.id = f"{id}"          # Peer identifier: "IP:Port"
         self.seeds = seeds         # List of file seed hashes
         self.sock = sock           # Peer socket connection
+        self.peer_encryption_key = None  # Peer encryption key (if any)
 
 # The tracker coordinates peers and seed availability
 class Tracker:
@@ -44,6 +49,7 @@ class Tracker:
         self.seeds = {}            # Map: seed hash -> list of peers
         self.connections = {}      # Map: peer ID -> Peer object
         self.on = True           # Tracker status flag
+        self.peer_encryption_key = {}
 
         try:
             self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -79,6 +85,14 @@ class Tracker:
 
         print(f"{SUCCESS}Peer {HIGHLIGHT}{peer.id}{SUCCESS} removed from tracker records{RESET}")
 
+    def generate_encryption_key_for_each_seed(self, seed):
+        # Generate a unique encryption key for each seed
+        if seed not in self.peer_encryption_key:
+            key = Fernet.generate_key()
+            self.peer_encryption_key[seed] = key
+            print(f"{SUCCESS}Generated encryption key for seed {HIGHLIGHT}{seed}{SUCCESS}: {key.decode()}{RESET}")
+        return self.peer_encryption_key[seed]
+    
     # Clean up all peer sockets and shut down tracker socket
     def __del__(self):
         print(f"{STATUS}Cleaning up all sockets...{RESET}")
@@ -102,10 +116,17 @@ class Tracker:
         payload = { seed: [p.id for p in peers if p.id != peer.id]
                     for seed, peers in self.seeds.items() }
 
-        message = json.dumps(payload).encode('utf8')
+        for seed in payload:
+            # Generate encryption key for each seed
+            key = self.generate_encryption_key_for_each_seed(seed)
+            payload[seed].append(key.decode())  # Append the encryption key to the list
         
+        message = json.dumps(payload).encode('utf8')
+        token = master_cipher.encrypt(message)  # Encrypt the message
+        print(message)
+        print(token)
         try:
-            sock_peer.sendall(message)
+            sock_peer.sendall(token)
         except Exception as e:
             print(f"{ERROR}Error sending update to peer {HIGHLIGHT}{peer.id}{ERROR}: {e}{RESET}")
             self.kick_peer(peer)

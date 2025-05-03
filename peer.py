@@ -12,6 +12,10 @@ import shutil
 import select
 import sys
 from colorama import Fore, Style, init
+from cryptography.fernet import Fernet
+
+MASTER_KEY = b"hLNpt1Oc7DpFtmwJgeAq_wK7zR77JZyGyVcjRJGrYU0="  
+master_cipher = Fernet(MASTER_KEY)
 
 # Initialize colorama
 init(autoreset=True)
@@ -29,7 +33,7 @@ UPDATE_TIME = 5
 
 # Timeout for recv requests (in seconds)
 
-RECV_TIMEOUT = 2  
+RECV_TIMEOUT = 10 
 
 # File transfer chunk size (256 KB)
 
@@ -50,6 +54,7 @@ WARNING = Fore.YELLOW
 ERROR = Fore.RED
 HIGHLIGHT = Fore.MAGENTA
 RESET = Style.RESET_ALL
+DEBUG = Fore.BLUE
 
 # Represents a file and its status
 
@@ -115,6 +120,7 @@ class me:
         self.port = 0
         self.seeds = {}             # seed -> list of peer IDs
         self.connections = {}       # peer ID -> socket
+        self.peer_encryption_key = {} # seed -> encryption key
         self.tracker_sock = None
         self.on = True
         self.files = {}             # seed -> File object
@@ -167,7 +173,15 @@ class me:
                     print(f"{WARNING}Tracker update timed out{RESET}")                     
                     continue                                                                   
 
-                msg = self.tracker_sock.recv(100000000).decode()              
+                token = self.tracker_sock.recv(1000000000) 
+                
+                try:
+                    plain = master_cipher.decrypt(token)
+                except Exception as e:
+                    print(f"{ERROR}Error decrypting update from tracker: {e}{RESET}")
+                    continue
+                    
+                message = plain.decode("utf-8")
             except socket.error as e:
                 print(f"{ERROR}Error receiving update from tracker: {e}{RESET}")
                 continue
@@ -175,19 +189,24 @@ class me:
                 print(f"{ERROR}Error: {e}{RESET}")
                 continue
                            
-            all_seeds = json.loads(msg)
+            all_seeds = json.loads(message)
+            print(f"{INFO}Received update from tracker: {HIGHLIGHT}{all_seeds}{RESET}") 
             temp_seeds = {}
             
             # Update the seeds dictionary with the new peer list
             for seed in all_seeds:
                 if seed in self.seeds.keys():
-                    temp_seeds[seed] = all_seeds[seed]
-                    
+                    temp_seeds[seed] = all_seeds[seed][:-1]
+            for seeds in all_seeds.keys():
+                if seed not in self.peer_encryption_key.keys():
+                    self.peer_encryption_key[seed] = all_seeds[seed][-1].encode()
+            
             # Check if the seeds have changed
             if(temp_seeds != self.seeds):
                 print(f"{HIGHLIGHT}New seeds available{RESET}")
                 
                 self.seeds = temp_seeds
+                
         self.tracker_sock.close()
         print(f"{SUCCESS}Tracker connection closed{RESET}")
                 
@@ -234,11 +253,11 @@ class me:
 
     # Handle incoming requests from other peers (upload)
     def recv_msg_peer(self, sock_peer, peer_addr):
-        
+    
         # Add the peer to the connections dictionary
         with self.lock:
             self.connections[peer_addr] = sock_peer
-        
+
         print(f"{INFO}Peer {HIGHLIGHT}{peer_addr}{INFO} connected{RESET}")
         sock_peer.setblocking(True)
 
@@ -249,76 +268,125 @@ class me:
             sock_peer.close()                                             
             with self.lock:
                 del self.connections[peer_addr]
-            return                                                         
-        req = sock_peer.recv(10000000)  
-        
-        print(f"{INFO}Received request from {HIGHLIGHT}{peer_addr}{INFO}: {req.decode()}{RESET}")
-        
+            return  
+
+        req_token = sock_peer.recv(10000000)  
+
+        cipher = None
+        used_seed = None
+
+        for seed_key, key in self.peer_encryption_key.items():
+            cipher_temp = Fernet(key)
+            try:
+                plain = cipher_temp.decrypt(req_token)
+                cipher = cipher_temp
+                used_seed = seed_key
+                break
+            except Exception as e:
+                continue
+        else:
+            print(f"{ERROR}Error decrypting request from {HIGHLIGHT}{peer_addr}{ERROR}: No valid decryption key found{RESET}")
+            sock_peer.close()
+            with self.lock:
+                del self.connections[peer_addr]
+            return
+
+        req = plain.decode()
+
+        print(f"{INFO}Received request from {HIGHLIGHT}{peer_addr}{INFO}: {req}{RESET}")
+
         # Check if the request is for a chunk list
-        if req.decode().startswith("Send chunk list for"):
-            seed = req.decode().split(" ")[-1]
+        if req.startswith("Send chunk list for"):
+            # FIXED: Corrected the string parsing - don't use decode() on a string
+            seed = req.split(" ")[-1]
             print(f"{INFO}Received request for chunk list for {HIGHLIGHT}{seed}{INFO} from {HIGHLIGHT}{peer_addr}{RESET}")
-            
+
+            cipher = Fernet(self.peer_encryption_key[used_seed])
             if seed not in self.files.keys():
-                sock_peer.sendall("Seed not available".encode())
+                encrypt_seed_not_available = cipher.encrypt("Seed not available".encode())
+                sock_peer.sendall(encrypt_seed_not_available)
                 sock_peer.close()
                 with self.lock:
                     del self.connections[peer_addr]
                 return
-            
+
             try:
-                sock_peer.sendall(json.dumps(list(self.files[seed].completed_chunks)).encode())
+                # Encrypt the chunk list with the peer's encryption key
+                encrypt_completed_chunks = cipher.encrypt(json.dumps(list(self.files[seed].completed_chunks)).encode())
+                sock_peer.sendall(encrypt_completed_chunks)
             except socket.error as e:
                 print(f"{ERROR}Error sending chunk list to {HIGHLIGHT}{peer_addr}{ERROR}: {e}")
                 sock_peer.close()
                 with self.lock:
                     del self.connections[peer_addr]
                 return
-            
+
             print(f"{SUCCESS}Sent chunk list for {HIGHLIGHT}{seed}{SUCCESS} to {HIGHLIGHT}{peer_addr}{RESET}")
-        
+
         # Serve requested chunks
         ready, _, _ = select.select([sock_peer], [], [], RECV_TIMEOUT)  
         if not ready:                                                     
             print(f"{ERROR}Peer {HIGHLIGHT}{peer_addr}{ERROR} serve timed out{RESET}")  
             sock_peer.close()                                             
-            return                                                         
-        req = sock_peer.recv(10000000)  
-        
-        print(f"{INFO}Received request from {HIGHLIGHT}{peer_addr}{INFO}: {req.decode()}{RESET}")
-        
-        # Loop until the peer disconnects or sends "exit"
-        while req.decode() != "exit":
-            if req.decode().startswith("Requesting chunk"):
-                chunk = int(req.decode().split(" ")[2])
-                seed = req.decode().split(" ")[-1]
-                
-                print(f"{INFO}Received request for chunk {HIGHLIGHT}{chunk}{INFO} from {HIGHLIGHT}{peer_addr}{RESET}")
-                
-                with open(os.path.join(self.files[seed].path,"chunks", str(chunk)), "rb") as f:
-                    data = f.read()
-                    
-                    try:
-                        sock_peer.sendall(data)
-                    except socket.error as e:
-                        print(f"{ERROR}Error sending chunk {HIGHLIGHT}{chunk}{ERROR} to {HIGHLIGHT}{peer_addr}{RESET}: {e}")
+            with self.lock:
+                del self.connections[peer_addr]
+            return    
+
+        req_token = sock_peer.recv(10000000)  
+        try:
+            req = cipher.decrypt(req_token)
+            req_str = req.decode()
+            print(f"{INFO}Received request from {HIGHLIGHT}{peer_addr}{INFO}: {req_str}{RESET}")
+
+            # Loop until the peer disconnects or sends "exit"
+            while req_str != "exit":
+                if req_str.startswith("Requesting chunk"):
+                    # Parse the chunk number and seed from the request
+                    parts = req_str.split(" ")
+                    chunk = int(parts[2])
+                    seed = parts[-1]
+
+                    print(f"{INFO}Received request for chunk {HIGHLIGHT}{chunk}{INFO} for {HIGHLIGHT}{seed}{INFO} from {HIGHLIGHT}{peer_addr}{RESET}")
+
+                    # Read the chunk file and send it
+                    chunk_path = os.path.join(self.files[seed].path, "chunks", str(chunk))
+                    if os.path.exists(chunk_path):
+                        with open(chunk_path, "rb") as f:
+                            data = f.read()
+
+                            try:
+                                encrypt_data = cipher.encrypt(data)
+                                print(f"{DEBUG}Sending encrypted data for chunk {HIGHLIGHT}{chunk}{RESET}")
+                                sock_peer.sendall(encrypt_data)
+                            except socket.error as e:
+                                print(f"{ERROR}Error sending chunk {HIGHLIGHT}{chunk}{ERROR} to {HIGHLIGHT}{peer_addr}{RESET}: {e}")
+                                break
+                            
+                            print(f"{SUCCESS}Sent chunk {HIGHLIGHT}{chunk}{SUCCESS} to {HIGHLIGHT}{peer_addr}{RESET}")
+                    else:
+                        print(f"{ERROR}Chunk {HIGHLIGHT}{chunk}{ERROR} not found for {HIGHLIGHT}{seed}{RESET}")
+                        error_msg = cipher.encrypt(f"Chunk {chunk} not found".encode())
+                        sock_peer.sendall(error_msg)
                         break
                     
-                    print(f"{SUCCESS}Sent chunk {HIGHLIGHT}{chunk}{SUCCESS} to {HIGHLIGHT}{peer_addr}{RESET}")
-                    
-            ready, _, _ = select.select([sock_peer], [], [], RECV_TIMEOUT)  
-            if not ready:                                                     
-                print(f"{ERROR}Peer {HIGHLIGHT}{peer_addr}{ERROR} chunk transfer timed out{RESET}")  
-                break                                                         
-            req = sock_peer.recv(10000000)  
+                ready, _, _ = select.select([sock_peer], [], [], RECV_TIMEOUT)  
+                if not ready:                                                     
+                    print(f"{ERROR}Peer {HIGHLIGHT}{peer_addr}{ERROR} chunk transfer timed out{RESET}")  
+                    break 
 
-        
+                req_token = sock_peer.recv(10000000)  
+                req = cipher.decrypt(req_token)
+                req_str = req.decode()
+                print(f"{INFO}Next request from {HIGHLIGHT}{peer_addr}{INFO}: {req_str}{RESET}")
+        except Exception as e:
+            print(f"{ERROR}Error processing request from {HIGHLIGHT}{peer_addr}{ERROR}: {e}{RESET}")
+
         print(f"{INFO}Peer {HIGHLIGHT}{peer_addr}{INFO} disconnected{RESET}")
         with self.lock:
             if peer_addr in self.connections.keys():
                 del self.connections[peer_addr]
         sock_peer.close()
-
+        
     # Accept incoming connections from peers (threaded)
     def handle_peer_requests(self):
         while self.on:
@@ -338,94 +406,104 @@ class me:
         print(f"{SUCCESS}Peer socket closed{RESET}")
 
     # Manage downloading chunks from a single peer
-    def manage_peer(self, peer, seed):
-        
-        print(f"{INFO}Managing peer {HIGHLIGHT}{peer}{INFO} for seed {HIGHLIGHT}{seed}{RESET}")
-        
-        if peer in self.connections.keys():
-            print(f"{WARNING}Peer {HIGHLIGHT}{peer}{WARNING} already connected{RESET}")
+    def manage_peer(self, peer_id, seed):
+        print(f"{INFO}Managing peer {HIGHLIGHT}{peer_id}{INFO} for seed {HIGHLIGHT}{seed}{RESET}")    # Skip if we already have a connection
+
+
+        if peer_id in self.connections:
+            print(f"{WARNING}Peer {HIGHLIGHT}{peer_id}{WARNING} already connected{RESET}")
             return
-        
-        peer = Peer(peer, None)
-        peer.ip ,peer.port = peer.id.split(":")
-        peer.port = int(peer.port)
+
+        # Split the peer_id "IP:Port" string into ip & port
+        ip, port_str = peer_id.split(":")
+        port = int(port_str)
+
+        # Connect
         try:
-            peer.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            peer.sock.connect((peer.ip, peer.port))
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((ip, port))
         except socket.error as e:
-            print(f"{ERROR}Error connecting to peer {HIGHLIGHT}{peer.id}{ERROR}: {e}{RESET}")
-            return
-        with self.lock:
-            self.connections[peer.id] = peer.sock
-        
-        peer.sock.setblocking(True)
-        peer.sock.sendall(("Send chunk list for "+seed).encode())
-        
-        # Wait for the peer to respond with the chunk list
-        ready, _, _ = select.select([peer.sock], [], [], RECV_TIMEOUT)  
-        if not ready:                                                     
-            print(f"{WARNING}Timeout requesting chunk list from {HIGHLIGHT}{peer.id}{WARNING}{RESET}")  
-            peer.sock.close()                                             
-            return                                                         
-        data = peer.sock.recv(1000000)  
-
-        
-        # Check if the seed is available with the peer
-        if(data.decode() == "Seed not available"):
-            print(f"{WARNING}Seed {HIGHLIGHT}{seed}{WARNING} not available with peer {HIGHLIGHT}{peer.id}{RESET}")
-            peer.sock.close()
-            del self.connections[peer.id]
-            return
-        
-        available_chunks = json.loads(data)
-        
-        print(f"{INFO}Available chunks from peer {HIGHLIGHT}{peer.id}{INFO}: {available_chunks}{RESET}")
-        
-        # Check if the peer has any chunks available
-        if len(available_chunks) == 0:
-            print(f"{WARNING}No available chunks from peer {HIGHLIGHT}{peer.id}{RESET}")
-            peer.sock.close()
-            del self.connections[peer.id]
+            print(f"{ERROR}Error connecting to peer {HIGHLIGHT}{peer_id}{ERROR}: {e}{RESET}")
             return
 
-        # Randomly choose missing chunks to download
-        chunks = []
-        while len(chunks) < max_chunks_per_connection and available_chunks:
-            with self.lock:
-                chunk = random.choice(available_chunks)
-                available_chunks.remove(chunk)
-                if chunk not in self.files[seed].completed_chunks:
-                    chunks.append(chunk)
-                    self.files[seed].completed_chunks.add(chunk)
+        self.connections[peer_id] = sock
+        sock.setblocking(True)
 
-        # Check if there are any chunks to download
-        for chunk in chunks:
-            print(f"{INFO}Requesting chunk {HIGHLIGHT}{chunk}{INFO} from peer {HIGHLIGHT}{peer.id}{RESET}")
-            try:
-                peer.sock.sendall(("Requesting chunk "+ str(chunk) + " for "+seed).encode())
-            except socket.error as e:
-                print(f"{ERROR}Error requesting chunk {HIGHLIGHT}{chunk}{ERROR} from peer {HIGHLIGHT}{peer.id}{RESET}: {e}")
-                with self.lock:
-                    self.files[seed].completed_chunks.remove(chunk)
-                continue
+        # Prepare encryption for this seed
+        seed_key = self.peer_encryption_key[seed]
+        cipher = Fernet(seed_key)
+
+        # 1) Request the chunk list - FIXED: Using the expected format
+        req = f"Send chunk list for {seed}"
+        token = cipher.encrypt(req.encode("utf-8"))
+        sock.sendall(token)
+
+        # 2) Receive & decrypt the response
+        ready, _, _ = select.select([sock], [], [], RECV_TIMEOUT)
+        if not ready:
+            print(f"{WARNING}Timeout requesting chunk list from {HIGHLIGHT}{peer_id}{WARNING}{RESET}")
+            sock.close()
+            del self.connections[peer_id]
+            return
+
+        token = sock.recv(10_000_000)
+        try:
+            plain = cipher.decrypt(token)
+            available_chunks = json.loads(plain.decode("utf-8"))
+        
+            if isinstance(available_chunks, str) and available_chunks == "Seed not available":
+                print(f"{WARNING}Seed {HIGHLIGHT}{seed}{WARNING} not available from {HIGHLIGHT}{peer_id}{RESET}")
+                sock.close()
+                del self.connections[peer_id]
+                return
             
-            ready, _, _ = select.select([peer.sock], [], [], RECV_TIMEOUT)  
-            if not ready:                                                     
-                print(f"{ERROR}Chunk {HIGHLIGHT}{chunk}{ERROR} recv timed out from {HIGHLIGHT}{peer.id}{RESET}")  
+            print(f"{INFO}Available chunks from peer {HIGHLIGHT}{peer_id}{INFO}: {available_chunks}{RESET}")
+            if not available_chunks:
+                sock.close()
+                del self.connections[peer_id]
+                return
+        except Exception as e:
+            print(f"{ERROR}Error decrypting chunk list from {HIGHLIGHT}{peer_id}{ERROR}: {e}{RESET}")
+            sock.close()
+            del self.connections[peer_id]
+            return
+
+        # 3) Download up to max_chunks_per_connection
+        needed_chunks = [chunk for chunk in available_chunks 
+                    if chunk not in self.files[seed].completed_chunks]
+        chunks_to_download = needed_chunks[:max_chunks_per_connection]
+    
+        for chunk in chunks_to_download:
+            # FIXED: Using the expected request format
+            req = f"Requesting chunk {chunk} for {seed}"
+            token = cipher.encrypt(req.encode("utf-8"))
+            sock.sendall(token)
+
+            ready, _, _ = select.select([sock], [], [], RECV_TIMEOUT)
+            if not ready:
+                print(f"{ERROR}Chunk {HIGHLIGHT}{chunk}{ERROR} recv timed out from {HIGHLIGHT}{peer_id}{RESET}")
                 break
-            data = peer.sock.recv(1000000)       
-            
-            with open(os.path.join(self.files[seed].path,"chunks", str(chunk)), "wb") as f:
-                f.write(data)
-                print(f"{SUCCESS}Received chunk {HIGHLIGHT}{chunk}{SUCCESS} from peer {HIGHLIGHT}{peer.id}{RESET}")
-        
-        with self.lock:
-            print(f"{INFO}Completed chunks for {HIGHLIGHT}{seed}{INFO}: {self.files[seed].completed_chunks}{RESET}")
-            self.files[seed].update_status_file()
 
-        peer.sock.sendall("exit".encode())
-        peer.sock.close()
-        del self.connections[peer.id]
+            try:
+                token = sock.recv(10_000_000)
+                data = cipher.decrypt(token)
+            
+                # Write chunk to disk
+                with open(os.path.join(self.files[seed].path, "chunks", str(chunk)), "wb") as f:
+                    f.write(data)
+                self.files[seed].completed_chunks.add(chunk)
+                self.files[seed].update_status_file()
+                print(f"{SUCCESS}Received chunk {HIGHLIGHT}{chunk}{SUCCESS} from {HIGHLIGHT}{peer_id}{RESET}")
+            except Exception as e:
+                print(f"{ERROR}Error receiving chunk {HIGHLIGHT}{chunk}{ERROR} from {HIGHLIGHT}{peer_id}{ERROR}: {e}{RESET}")
+                break
+
+        # 4) Tell peer we're done
+        exit_token = cipher.encrypt("exit".encode("utf-8"))
+        sock.sendall(exit_token)
+
+        sock.close()
+        del self.connections[peer_id]
 
     # Attempt to download chunks for the specified seed
     def manage_seed(self, seed):
