@@ -555,6 +555,8 @@ def main():
     # Create a root window for Tkinter
     root = tk.Tk()
     root.withdraw()  # Hide the root window
+    root.lift()      # Bring dialog to front (on some systems)
+    root.attributes('-topmost', True)
     
     # Check if the directory exists, if not create it
     if not os.path.exists(dir_name):
