@@ -5,6 +5,8 @@
 import random
 import socket
 import threading
+import tkinter as tk
+from tkinter import filedialog
 import time
 import json
 import os
@@ -550,6 +552,10 @@ class me:
 # Entry point: handles CLI and starts peer functionality
 
 def main():
+    # Create a root window for Tkinter
+    root = tk.Tk()
+    root.withdraw()  # Hide the root window
+    
     # Check if the directory exists, if not create it
     if not os.path.exists(dir_name):
         os.makedirs(dir_name)
@@ -576,7 +582,14 @@ def main():
             
             
             seed = input(f"{INFO}Enter the seed: {RESET}")
-            file_path = input(f"{INFO}Enter the file path: {RESET}")
+            
+            # Dialog to select a file to seed
+            file_path = filedialog.askopenfilename(title="Select a file to seed")
+            
+            if not file_path: #if no file is selected, continue to next iteration
+                print(f"{ERROR}No file selected{RESET}")
+                continue
+            
             size = os.path.getsize(file_path)
             name = os.path.basename(file_path)
             
@@ -650,6 +663,8 @@ def main():
         else:
             print(f"{ERROR}Invalid operation{RESET}")
             continue
+        
+    root.destroy()  # Close the Tkinter root window
     # Start peer services and threads
     main_peer = me(tracker_ip)
 
