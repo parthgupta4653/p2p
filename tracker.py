@@ -28,7 +28,7 @@ RESET = Style.RESET_ALL
 CHECK_PEER_TIMEOUT = 300
 
 # Timeout for recv requests (in seconds)
-RECV_TIMEOUT = 2  
+RECV_TIMEOUT = 60  
 
 # Limit on simultaneous peer connections
 MAX_PEER_CONNECTIONS = 20

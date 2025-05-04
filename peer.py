@@ -4,6 +4,7 @@
 
 import random
 import socket
+import struct
 import threading
 import tkinter as tk
 from tkinter import filedialog
@@ -35,11 +36,11 @@ UPDATE_TIME = 5
 
 # Timeout for recv requests (in seconds)
 
-RECV_TIMEOUT = 10 
+RECV_TIMEOUT = 120 
 
 # File transfer chunk size (256 KB)
 
-chunk_size = 256*1024
+chunk_size = 4*1024
 
 # Max chunks to request from a peer in one connection
 
@@ -178,14 +179,15 @@ class me:
             all_seeds = json.loads(message)
             print(f"{INFO}Received update from tracker: {HIGHLIGHT}{all_seeds}{RESET}") 
             temp_seeds = {}
-            
+            print(all_seeds)
             # Update the seeds dictionary with the new peer list
             for seed in all_seeds:
                 if seed in self.seeds.keys():
                     temp_seeds[seed] = all_seeds[seed][:-1]
             for seeds in all_seeds.keys():
-                if seed not in self.peer_encryption_key.keys():
-                    self.peer_encryption_key[seed] = all_seeds[seed][-1].encode()
+                print(seeds)
+                if seeds not in self.peer_encryption_key.keys():
+                    self.peer_encryption_key[seeds] = all_seeds[seeds][-1].encode()
             
             # Check if the seeds have changed
             if(temp_seeds != self.seeds):
@@ -342,6 +344,7 @@ class me:
 
                             try:
                                 encrypt_data = cipher.encrypt(data)
+                                encrypt_data = struct.pack('!I', len(encrypt_data))+encrypt_data
                                 print(f"{DEBUG}Sending encrypted data for chunk {HIGHLIGHT}{chunk}{RESET}")
                                 sock_peer.sendall(encrypt_data)
                             except socket.error as e:
@@ -390,6 +393,15 @@ class me:
             self.recv_msg_thread.start()
         self.s.close()
         print(f"{SUCCESS}Peer socket closed{RESET}")
+
+    def chunk_recv_helper(self, sock: socket.socket, nbytes: int) -> bytes:
+        buf = b''
+        while len(buf) < nbytes:
+            chunk = sock.recv(nbytes - len(buf))
+            if not chunk:
+                raise ConnectionError("Socket closed prematurely")
+            buf += chunk
+        return buf
 
     # Manage downloading chunks from a single peer
     def manage_peer(self, peer_id, seed):
@@ -463,7 +475,7 @@ class me:
                  available_chunks.remove(chunk)
                  if chunk not in self.files[seed].completed_chunks:
                      chunks_to_download.append(chunk)
-                     self.files[seed].completed_chunks.add(chunk)
+
     
         for chunk in chunks_to_download:
             # FIXED: Using the expected request format
@@ -476,18 +488,18 @@ class me:
                 sock.sendall(token)
             except socket.error as e:
                 print(f"{ERROR}Error sending request for chunk {HIGHLIGHT}{chunk}{ERROR} to {HIGHLIGHT}{peer_id}{RESET}: {e}")
-                with self.lock:
-                    self.files[seed].completed_chunks.remove(chunk)
                 continue
 
             ready, _, _ = select.select([sock], [], [], RECV_TIMEOUT)
             if not ready:
                 print(f"{ERROR}Chunk {HIGHLIGHT}{chunk}{ERROR} recv timed out from {HIGHLIGHT}{peer_id}{RESET}")
-                with self.lock:
-                    self.files[seed].completed_chunks.remove(chunk)
                 continue
             try:
-                token = sock.recv(10_000_000)
+                #token = sock.recv(10_000_000).decode()
+                raw_len = self.chunk_recv_helper(sock, 4)
+                (token_len,) = struct.unpack('!I', raw_len)
+                
+                token = self.chunk_recv_helper(sock, token_len)
                 data = cipher.decrypt(token)
             
                 # Write chunk to disk
@@ -500,8 +512,6 @@ class me:
                 print(f"{SUCCESS}Received chunk {HIGHLIGHT}{chunk}{SUCCESS} from {HIGHLIGHT}{peer_id}{RESET}")
             except Exception as e:
                 print(f"{ERROR}Error receiving chunk {HIGHLIGHT}{chunk}{ERROR} from {HIGHLIGHT}{peer_id}{ERROR}: {e}{RESET}")
-                with self.lock:
-                    self.files[seed].completed_chunks.remove(chunk)
                 continue
 
         # 4) Tell peer we're done
@@ -513,6 +523,7 @@ class me:
 
     # Attempt to download chunks for the specified seed
     def manage_seed(self, seed):
+        print(self.peer_encryption_key)
         print(f"{INFO}Managing seed {HIGHLIGHT}{seed}{RESET}")
         
         if(self.files[seed].status == "completed"):
