@@ -36,7 +36,7 @@ UPDATE_TIME = 5
 
 # Timeout for recv requests (in seconds)
 
-RECV_TIMEOUT = 120 
+RECV_TIMEOUT = 1220
 
 # File transfer chunk size (256 KB)
 
