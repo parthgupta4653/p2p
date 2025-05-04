@@ -21,9 +21,9 @@ The system consists of:
 
 ## Project Structure
 
-├── tracker.py # Tracker Side Implementation
-├── peer.py # Peer Side Implementation
-└── README.md # Project documentation
+- tracker.py # Tracker Side Implementation
+- peer.py # Peer Side Implementation
+- README.md # Project documentation
 
 
 ## How to Run
